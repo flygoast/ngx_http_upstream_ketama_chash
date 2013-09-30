@@ -481,7 +481,8 @@ ngx_http_upstream_init_ketama_chash_peer(ngx_http_request_t *r,
 
     if (!ukchpd->peers->single) {
         ukchpd->point = ngx_crc32_short(val.data, val.len);
-        ukchpd->conti_index = ngx_http_upstream_get_ketama_chash_index(ukchpd);
+        ukchpd->conti_index = (ukchpd->point == 0) ? 0 :
+                              ngx_http_upstream_get_ketama_chash_index(ukchpd);
     }
 
     return NGX_OK;
