@@ -510,6 +510,7 @@ ngx_http_upstream_ketama_chash(ngx_conf_t *cf, ngx_command_t *cmd,
     sc.source = &value[1];
     sc.lengths = &vars_lengths;
     sc.values = &vars_values;
+    sc.variables = ngx_http_script_variables_count(&value[1]);
     sc.complete_lengths = 1;
     sc.complete_values = 1;
 
