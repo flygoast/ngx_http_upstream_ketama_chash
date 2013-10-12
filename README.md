@@ -8,7 +8,7 @@ The `usptream_ketama_chash` module is a load balancer which provides upstream lo
 
     upstream backend {
         ...
-        ketama_chash    $request_uri;
+        ketama_chash    $uri;
     }
     
 ## Installation
