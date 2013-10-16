@@ -65,15 +65,19 @@ typedef struct {
 } ngx_http_upstream_ketama_chash_peer_t;
 
 
-typedef struct {
+typedef struct ngx_http_upstream_ketama_chash_peers_s
+    ngx_http_upstream_ketama_chash_peers_t;
+
+struct ngx_http_upstream_ketama_chash_peers_s {
     ngx_uint_t                               number;
     ngx_uint_t                               vnode_number;
     ngx_uint_t                               total_weight;
     unsigned                                 single:1;
     ngx_str_t                               *name;
+    ngx_http_upstream_ketama_chash_peers_t  *next;
     ngx_http_upstream_ketama_chash_vnode_t  *continuum;
     ngx_http_upstream_ketama_chash_peer_t    peer[0];
-} ngx_http_upstream_ketama_chash_peers_t;
+};
 
 
 typedef struct {
@@ -101,6 +105,8 @@ static void ngx_http_upstream_free_ketama_chash_peer(ngx_peer_connection_t *pc,
     void *data, ngx_uint_t state);
 static ngx_uint_t ngx_http_upstream_get_ketama_chash_index(
     ngx_http_upstream_ketama_chash_peer_data_t *ukchpd);
+static ngx_int_t ngx_http_upstream_ketama_chash_generate_continuum(
+    ngx_conf_t *cf, ngx_http_upstream_ketama_chash_peers_t *peers);
 
 
 static ngx_command_t ngx_http_upstream_ketama_chash_commands[] = {
@@ -152,17 +158,9 @@ static ngx_int_t
 ngx_http_upstream_init_ketama_chash(ngx_conf_t *cf,
     ngx_http_upstream_srv_conf_t *us)
 {
-    ngx_uint_t                               i, j, m, n, p, s, w, nvnode, last;
-    ngx_uint_t                              *peer_index;
-    ngx_uint_t                              *checked, check_data;
-    u_char                                   tmp_vnode[32];
-    u_char                                   result[16];
-    ngx_md5_t                                md5;
-    float                                    percent;
-    ngx_array_t                             *peer_indexes, *last_indexes;
+    ngx_uint_t                               i, j, n, s, w;
     ngx_http_upstream_server_t              *server;
-    ngx_http_upstream_ketama_chash_peers_t  *peers;
-    ngx_http_upstream_ketama_chash_vnode_t  *vnode;
+    ngx_http_upstream_ketama_chash_peers_t  *peers, *backup;
 
     s = 0;
 
@@ -186,6 +184,9 @@ ngx_http_upstream_init_ketama_chash(ngx_conf_t *cf,
     }
 
     if (n == 0) {
+        ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
+                      "no servers in upstream \"%V\" in %s:%ui",
+                      &us->host, us->file_name, us->line);
         return NGX_ERROR;
     }
 
@@ -202,6 +203,7 @@ ngx_http_upstream_init_ketama_chash(ngx_conf_t *cf,
     peers->name = &us->host;
 
     n = 0;
+
     for (i = 0; i < us->servers->nelts; i++) {
         for (j = 0; j < server[i].naddrs; j++) {
             if (server[i].backup) {
@@ -219,221 +221,75 @@ ngx_http_upstream_init_ketama_chash(ngx_conf_t *cf,
         }
     }
 
-    n = KETAMA_NVNODE * peers->number;
-    peers->continuum = ngx_pcalloc(cf->pool,
-                            n * sizeof(ngx_http_upstream_ketama_chash_vnode_t));
-    if (peers->continuum == NULL) {
+    us->peer.data = peers;
+
+    if (peers->number > 1) {
+        if (ngx_http_upstream_ketama_chash_generate_continuum(cf, peers)
+            != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+    }
+
+    /* backup servers */
+
+    n = 0;
+    w = 0;
+
+    for (i = 0; i < us->servers->nelts; i++) {
+        if (!server[i].backup) {
+            continue;
+        }
+
+        n += server[i].naddrs;
+        w += server[i].naddrs * server[i].weight;
+    }
+
+    if (n == 0) {
+        return NGX_OK;
+    }
+
+    backup = ngx_pcalloc(cf->pool, 
+                         sizeof(ngx_http_upstream_ketama_chash_peers_t)
+                         + sizeof(ngx_http_upstream_ketama_chash_peer_t) * n);
+    if (backup == NULL) {
         return NGX_ERROR;
     }
 
-    peers->vnode_number = 0;
+    peers->single = 0;
+    backup->single = 0;
+    backup->number = n;
+    backup->total_weight = w;
+    backup->name = &us->host;
 
-    /* generate the consistent hash continuum */
-    for (i = 0; i < peers->number; i++) {
-        percent = (float)peers->peer[i].weight / (float)peers->total_weight;
-        nvnode = floorf(percent * (KETAMA_NVNODE / 4) * peers->number);
+    n = 0;
 
-        for (j = 0; j < nvnode; j++) {
-
-            ngx_snprintf(tmp_vnode, sizeof(tmp_vnode), "%V-%ui%Z",
-                         &peers->peer[i].name, j);
-            ngx_md5_init(&md5);
-            ngx_md5_update(&md5, tmp_vnode, ngx_strlen(tmp_vnode));
-            ngx_md5_final(result, &md5);
-
-            for (n = 0; n < 4; n++) {
-                vnode = &peers->continuum[peers->vnode_number++];
-
-                vnode->point = (result[3 + n * 4] << 24)
-                               |(result[2 + n * 4] << 16)
-                               |(result[1 + n * 4] << 8)
-                               |(result[n * 4]);
-                vnode->index = i;
-            }
-        }
-    }
-
-    /* sort in ascending order of "point" */
-    ngx_qsort(peers->continuum, 
-              (size_t)peers->vnode_number,
-              sizeof(ngx_http_upstream_ketama_chash_vnode_t), 
-              ngx_http_cmp_ketama_chash_vnode);
-
-    if (!peers->single) {
-        if (peers->number <= 8 * sizeof(uintptr_t)) {
-            checked = &check_data;
-
-        } else {
-            s = (peers->number + (8 * sizeof(uintptr_t) - 1))
-                / (8 * sizeof(uintptr_t));
-
-            checked = ngx_palloc(cf->temp_pool, s * sizeof(uintptr_t));
-            if (checked == NULL) {
-                return NGX_ERROR;
-            }
-        }
-
-        /* process the first continuum slot */
-
-        if (peers->number <= 8 * sizeof(uintptr_t)) {
-            *checked = 0;
-
-        } else {
-            ngx_memzero(checked, s * sizeof(uintptr_t));
-        }
-
-        peer_indexes = ngx_array_create(cf->pool, peers->number,
-                                        sizeof(ngx_uint_t));
-        if (peer_indexes == NULL) {
-            return NGX_ERROR;
-        }
-
-        p = peers->continuum[0].index;
-        n = p / (8 * sizeof(uintptr_t));
-        m = (uintptr_t) 1 << p % (8 * sizeof(uintptr_t));
-
-        peer_index = ngx_array_push(peer_indexes);
-        if (peer_index == NULL) {
-            return NGX_ERROR;
-        }
-
-        *peer_index = p;
-        checked[n] |= m;
-
-        for (j = 1; j < peers->vnode_number; j++) {
-
-            p = peers->continuum[j].index;
-            n = p / (8 * sizeof(uintptr_t));
-            m = (uintptr_t) 1 << p % (8 * sizeof(uintptr_t));
-
-            if (checked[n] & m) {
+    for (i = 0; i < us->servers->nelts; i++) {
+        for (j = 0; j < server[i].naddrs; j++) {
+            if (!server[i].backup) {
                 continue;
             }
 
-            checked[n] |= m;
-
-            peer_index = ngx_array_push(peer_indexes);
-            if (peer_index == NULL) {
-                return NGX_ERROR;
-            }
-
-            *peer_index = peers->continuum[j].index;
+            backup->peer[n].sockaddr = server[i].addrs[j].sockaddr;
+            backup->peer[n].socklen = server[i].addrs[j].socklen;
+            backup->peer[n].name = server[i].addrs[j].name;
+            backup->peer[n].down = server[i].down;
+            backup->peer[n].weight = server[i].weight;
+            backup->peer[n].max_fails = server[i].max_fails;
+            backup->peer[n].fail_timeout = server[i].fail_timeout;
+            n++;
         }
+    }
 
-        peers->continuum[0].peer_indexes = peer_indexes;
+    peers->next = backup;
 
-        if (peer_indexes->nelts != peers->number) {
-            ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
-                          "invalid peer index number in continuum[0]");
+    if (backup->number > 1) {
+        if (ngx_http_upstream_ketama_chash_generate_continuum(cf, backup)
+            != NGX_OK)
+        {
             return NGX_ERROR;
         }
-
-        last = peers->continuum[0].index;
-        last_indexes = peers->continuum[0].peer_indexes;
-        for (j = peers->vnode_number - 1; j > 0; j--) {
-
-            p = peers->continuum[j].index;
-            if (p == last) {
-                peers->continuum[j].peer_indexes = last_indexes;
-                continue;
-            }
-
-            if (peers->number <= 8 * sizeof(uintptr_t)) {
-                *checked = 0;
-    
-            } else {
-                ngx_memzero(checked, s * sizeof(uintptr_t));
-            }
-
-            peer_indexes = ngx_array_create(cf->pool, peers->number,
-                                            sizeof(ngx_uint_t));
-            if (peer_indexes == NULL) {
-                return NGX_ERROR;
-            }
-    
-            peer_index = ngx_array_push(peer_indexes);
-            if (peer_index == NULL) {
-                return NGX_ERROR;
-            }
-
-            n = p / (8 * sizeof(uintptr_t));
-            m = (uintptr_t) 1 << p % (8 * sizeof(uintptr_t));
-
-            *peer_index = p;
-            checked[n] |= m;
-    
-            for (i = (j + 1) % peers->vnode_number;
-                 i != j;
-                 i = (i + 1) % peers->vnode_number)
-            {
-                p = peers->continuum[i].index;
-                n = p / (8 * sizeof(uintptr_t));
-                m = (uintptr_t) 1 << p % (8 * sizeof(uintptr_t));
-    
-                if (checked[n] & m) {
-                    continue;
-                }
-    
-                checked[n] |= m;
-    
-                peer_index = ngx_array_push(peer_indexes);
-                if (peer_index == NULL) {
-                    return NGX_ERROR;
-                }
-    
-                *peer_index = peers->continuum[i].index;
-
-                if (peer_indexes->nelts == peers->number) {
-                    break;
-                }
-            }
-    
-            peers->continuum[j].peer_indexes = peer_indexes;
-    
-            if (peer_indexes->nelts != peers->number) {
-                ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
-                              "invalid peer index number in continuum[%ud]",
-                              j);
-                return NGX_ERROR;
-            }
-
-            last = peers->continuum[j].index;
-            last_indexes = peer_indexes;
-        }
     }
-
-#if 0
-    {
-    u_char       buf[1024];
-    u_char      *p, *end;
-    ngx_uint_t  *value;
-
-    for (i = 0; i < peers->vnode_number; i++) {
-        p = buf;
-        end = buf + sizeof(buf);
-        peer_indexes = peers->continuum[i].peer_indexes;
-        value = peer_indexes->elts;
-
-        for (n = 0; n < peer_indexes->nelts; n++) {
-            p = ngx_slprintf(p, end, "%ud-", value[n]);
-        }
-
-        if (p > buf && *(p - 1) == '-') {
-            *(p - 1) = '\0';
-        }
-
-        ngx_log_error(NGX_LOG_NOTICE, cf->log, 0,
-                      "vnode[%ud] point: %uD, index: %ud, p: %p, indexes: %s",
-                      i,
-                      peers->continuum[i].point,
-                      peers->continuum[i].index,
-                      peers->continuum[i].peer_indexes,
-                      buf);
-    }
-    }
-#endif
-
-    us->peer.data = peers;
 
     return NGX_OK;
 }
@@ -479,8 +335,13 @@ ngx_http_upstream_init_ketama_chash_peer(ngx_http_request_t *r,
     r->upstream->peer.get = ngx_http_upstream_get_ketama_chash_peer;
     r->upstream->peer.tries = ukchpd->peers->number;
 
-    if (!ukchpd->peers->single) {
+    if (ukchpd->peers->number != 1
+        || (ukchpd->peers->next && ukchpd->peers->next->number != 1))
+    {
         ukchpd->point = ngx_crc32_short(val.data, val.len);
+    }
+
+    if (ukchpd->peers->number != 1) {
         ukchpd->conti_index = (ukchpd->point == 0) ? 0 :
                               ngx_http_upstream_get_ketama_chash_index(ukchpd);
     }
@@ -525,7 +386,8 @@ ngx_http_upstream_ketama_chash(ngx_conf_t *cf, ngx_command_t *cmd,
                   |NGX_HTTP_UPSTREAM_WEIGHT
                   |NGX_HTTP_UPSTREAM_MAX_FAILS
                   |NGX_HTTP_UPSTREAM_FAIL_TIMEOUT
-                  |NGX_HTTP_UPSTREAM_DOWN;
+                  |NGX_HTTP_UPSTREAM_DOWN
+                  |NGX_HTTP_UPSTREAM_BACKUP;
 
     ukchcf = ngx_http_conf_upstream_srv_conf(uscf, 
                                          ngx_http_upstream_ketama_chash_module);
@@ -674,6 +536,7 @@ ngx_http_upstream_get_peer(ngx_http_upstream_ketama_chash_peer_data_t *ukchpd,
 static ngx_int_t
 ngx_http_upstream_get_ketama_chash_peer(ngx_peer_connection_t *pc, void *data)
 {
+    ngx_int_t                                    rc;
     ngx_uint_t                                   i;
     ngx_http_upstream_ketama_chash_peer_t       *peer;
     ngx_http_upstream_ketama_chash_peers_t      *peers;
@@ -685,7 +548,13 @@ ngx_http_upstream_get_ketama_chash_peer(ngx_peer_connection_t *pc, void *data)
     pc->cached = 0;
     pc->connection = NULL;
 
-    if (ukchpd->peers->single) {
+    if (ukchpd->peers->number == 1) {
+        if (ukchpd->index > 0) { /* peer accessed */
+            goto failed;
+        }
+
+        ukchpd->index++;
+
         peer = &ukchpd->peers->peer[0];
 
         if (peer->down) {
@@ -707,11 +576,35 @@ ngx_http_upstream_get_ketama_chash_peer(ngx_peer_connection_t *pc, void *data)
     pc->socklen = peer->socklen;
     pc->name = &peer->name;
 
+    if (pc->tries == 1 && ukchpd->peers->next) {
+        pc->tries += ukchpd->peers->next->number;
+    }
+
     return NGX_OK;
 
 failed:
 
     peers = ukchpd->peers;
+
+    if (peers->next) {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, pc->log, 0,
+                       "ketama chash backup servers");
+
+        ukchpd->peers = peers->next;
+        ukchpd->index = 0;
+        pc->tries = ukchpd->peers->number;
+
+        if (ukchpd->peers->number != 1) {
+            ukchpd->conti_index = (ukchpd->point == 0) ? 0 :
+                               ngx_http_upstream_get_ketama_chash_index(ukchpd);
+        }
+
+        rc = ngx_http_upstream_get_ketama_chash_peer(pc, ukchpd);
+
+        if (rc != NGX_BUSY) {
+            return rc;
+        }
+    }
 
     /* all peers failed, mark them as live for quick recovery */
 
@@ -747,8 +640,13 @@ ngx_http_upstream_free_ketama_chash_peer(ngx_peer_connection_t *pc,
         return;
     }
 
-    value = ukchpd->peers->continuum[ukchpd->conti_index].peer_indexes->elts;
-    p = value[ukchpd->index - 1];
+    if (ukchpd->peers->number == 1) {
+        p = 0;
+
+    } else {
+        value = ukchpd->peers->continuum[ukchpd->conti_index].peer_indexes->elts;
+        p = value[ukchpd->index - 1];
+    }
 
     peer = &ukchpd->peers->peer[p];
 
@@ -775,4 +673,237 @@ ngx_http_upstream_free_ketama_chash_peer(ngx_peer_connection_t *pc,
     if (pc->tries) {
         pc->tries--;
     }
+}
+
+
+static ngx_int_t
+ngx_http_upstream_ketama_chash_generate_continuum(ngx_conf_t *cf,
+    ngx_http_upstream_ketama_chash_peers_t *peers)
+{
+    ngx_uint_t                               i, j, m, n, p, s, nvnode, last;
+    ngx_uint_t                              *peer_index;
+    ngx_uint_t                              *checked, check_data;
+    u_char                                   tmp_vnode[32];
+    u_char                                   result[16];
+    ngx_md5_t                                md5;
+    float                                    percent;
+    ngx_array_t                             *peer_indexes, *last_indexes;
+    ngx_http_upstream_ketama_chash_vnode_t  *vnode;
+
+    n = KETAMA_NVNODE * peers->number;
+
+    peers->continuum = ngx_pcalloc(cf->pool,
+                            n * sizeof(ngx_http_upstream_ketama_chash_vnode_t));
+    if (peers->continuum == NULL) {
+        return NGX_ERROR;
+    }
+
+    peers->vnode_number = 0;
+
+    /* generate the consistent hash continuum */
+    for (i = 0; i < peers->number; i++) {
+        percent = (float)peers->peer[i].weight / (float)peers->total_weight;
+        nvnode = floorf(percent * (KETAMA_NVNODE / 4) * peers->number);
+
+        for (j = 0; j < nvnode; j++) {
+
+            ngx_snprintf(tmp_vnode, sizeof(tmp_vnode), "%V-%ui%Z",
+                         &peers->peer[i].name, j);
+            ngx_md5_init(&md5);
+            ngx_md5_update(&md5, tmp_vnode, ngx_strlen(tmp_vnode));
+            ngx_md5_final(result, &md5);
+
+            for (n = 0; n < 4; n++) {
+                vnode = &peers->continuum[peers->vnode_number++];
+
+                vnode->point = (result[3 + n * 4] << 24)
+                               |(result[2 + n * 4] << 16)
+                               |(result[1 + n * 4] << 8)
+                               |(result[n * 4]);
+                vnode->index = i;
+            }
+        }
+    }
+
+    /* sort in ascending order of "point" */
+    ngx_qsort(peers->continuum, 
+              (size_t)peers->vnode_number,
+              sizeof(ngx_http_upstream_ketama_chash_vnode_t), 
+              ngx_http_cmp_ketama_chash_vnode);
+
+    s = 0;
+
+    if (peers->number <= 8 * sizeof(uintptr_t)) {
+        checked = &check_data;
+
+    } else {
+        s = (peers->number + (8 * sizeof(uintptr_t) - 1))
+            / (8 * sizeof(uintptr_t));
+
+        checked = ngx_palloc(cf->temp_pool, s * sizeof(uintptr_t));
+        if (checked == NULL) {
+            return NGX_ERROR;
+        }
+    }
+
+    /* process the first continuum slot */
+
+    if (peers->number <= 8 * sizeof(uintptr_t)) {
+        *checked = 0;
+
+    } else {
+        ngx_memzero(checked, s * sizeof(uintptr_t));
+    }
+
+    peer_indexes = ngx_array_create(cf->pool, peers->number,
+                                    sizeof(ngx_uint_t));
+    if (peer_indexes == NULL) {
+        return NGX_ERROR;
+    }
+
+    p = peers->continuum[0].index;
+    n = p / (8 * sizeof(uintptr_t));
+    m = (uintptr_t) 1 << p % (8 * sizeof(uintptr_t));
+
+    peer_index = ngx_array_push(peer_indexes);
+    if (peer_index == NULL) {
+        return NGX_ERROR;
+    }
+
+    *peer_index = p;
+    checked[n] |= m;
+
+    for (j = 1; j < peers->vnode_number; j++) {
+
+        p = peers->continuum[j].index;
+        n = p / (8 * sizeof(uintptr_t));
+        m = (uintptr_t) 1 << p % (8 * sizeof(uintptr_t));
+
+        if (checked[n] & m) {
+            continue;
+        }
+
+        checked[n] |= m;
+
+        peer_index = ngx_array_push(peer_indexes);
+        if (peer_index == NULL) {
+            return NGX_ERROR;
+        }
+
+        *peer_index = peers->continuum[j].index;
+    }
+
+    peers->continuum[0].peer_indexes = peer_indexes;
+
+    if (peer_indexes->nelts != peers->number) {
+        ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
+                      "invalid peer index number in continuum[0]");
+        return NGX_ERROR;
+    }
+
+    last = peers->continuum[0].index;
+    last_indexes = peers->continuum[0].peer_indexes;
+    for (j = peers->vnode_number - 1; j > 0; j--) {
+
+        p = peers->continuum[j].index;
+        if (p == last) {
+            peers->continuum[j].peer_indexes = last_indexes;
+            continue;
+        }
+
+        if (peers->number <= 8 * sizeof(uintptr_t)) {
+            *checked = 0;
+
+        } else {
+            ngx_memzero(checked, s * sizeof(uintptr_t));
+        }
+
+        peer_indexes = ngx_array_create(cf->pool, peers->number,
+                                        sizeof(ngx_uint_t));
+        if (peer_indexes == NULL) {
+            return NGX_ERROR;
+        }
+
+        peer_index = ngx_array_push(peer_indexes);
+        if (peer_index == NULL) {
+            return NGX_ERROR;
+        }
+
+        n = p / (8 * sizeof(uintptr_t));
+        m = (uintptr_t) 1 << p % (8 * sizeof(uintptr_t));
+
+        *peer_index = p;
+        checked[n] |= m;
+
+        for (i = (j + 1) % peers->vnode_number;
+             i != j;
+             i = (i + 1) % peers->vnode_number)
+        {
+            p = peers->continuum[i].index;
+            n = p / (8 * sizeof(uintptr_t));
+            m = (uintptr_t) 1 << p % (8 * sizeof(uintptr_t));
+
+            if (checked[n] & m) {
+                continue;
+            }
+
+            checked[n] |= m;
+
+            peer_index = ngx_array_push(peer_indexes);
+            if (peer_index == NULL) {
+                return NGX_ERROR;
+            }
+
+            *peer_index = peers->continuum[i].index;
+
+            if (peer_indexes->nelts == peers->number) {
+                break;
+            }
+        }
+
+        peers->continuum[j].peer_indexes = peer_indexes;
+
+        if (peer_indexes->nelts != peers->number) {
+            ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
+                          "invalid peer index number in continuum[%ud]",
+                          j);
+            return NGX_ERROR;
+        }
+
+        last = peers->continuum[j].index;
+        last_indexes = peer_indexes;
+    }
+
+#if 1
+    {
+    u_char       buf[1024];
+    u_char      *p, *end;
+    ngx_uint_t  *value;
+
+    for (i = 0; i < peers->vnode_number; i++) {
+        p = buf;
+        end = buf + sizeof(buf);
+        peer_indexes = peers->continuum[i].peer_indexes;
+        value = peer_indexes->elts;
+
+        for (n = 0; n < peer_indexes->nelts; n++) {
+            p = ngx_slprintf(p, end, "%ud-", value[n]);
+        }
+
+        if (p > buf && *(p - 1) == '-') {
+            *(p - 1) = '\0';
+        }
+
+        ngx_log_error(NGX_LOG_NOTICE, cf->log, 0,
+                      "vnode[%ud] point: %uD, index: %ud, p: %p, indexes: %s",
+                      i,
+                      peers->continuum[i].point,
+                      peers->continuum[i].index,
+                      peers->continuum[i].peer_indexes,
+                      buf);
+    }
+    }
+#endif
+
+    return NGX_OK;
 }
