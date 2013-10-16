@@ -874,7 +874,7 @@ ngx_http_upstream_ketama_chash_generate_continuum(ngx_conf_t *cf,
         last_indexes = peer_indexes;
     }
 
-#if 1
+#if 0
     {
     u_char       buf[1024];
     u_char      *p, *end;
