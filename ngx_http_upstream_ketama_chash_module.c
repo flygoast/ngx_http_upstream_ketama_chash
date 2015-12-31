@@ -158,11 +158,9 @@ static ngx_int_t
 ngx_http_upstream_init_ketama_chash(ngx_conf_t *cf,
     ngx_http_upstream_srv_conf_t *us)
 {
-    ngx_uint_t                               i, j, n, s, w;
+    ngx_uint_t                               i, j, n, w;
     ngx_http_upstream_server_t              *server;
     ngx_http_upstream_ketama_chash_peers_t  *peers, *backup;
-
-    s = 0;
 
     us->peer.init = ngx_http_upstream_init_ketama_chash_peer;
 
@@ -299,7 +297,6 @@ static ngx_int_t
 ngx_http_upstream_init_ketama_chash_peer(ngx_http_request_t *r,
     ngx_http_upstream_srv_conf_t *us)
 {
-    ngx_uint_t                                   n;
     ngx_str_t                                    val;
     ngx_http_upstream_ketama_chash_conf_t       *ukchcf;
     ngx_http_upstream_ketama_chash_peer_data_t  *ukchpd;
@@ -328,8 +325,6 @@ ngx_http_upstream_init_ketama_chash_peer(ngx_http_request_t *r,
     r->upstream->peer.data = ukchpd;
 
     ukchpd->peers = us->peer.data;
-
-    n = ukchpd->peers->number;
 
     r->upstream->peer.free = ngx_http_upstream_free_ketama_chash_peer;
     r->upstream->peer.get = ngx_http_upstream_get_ketama_chash_peer;
@@ -482,13 +477,10 @@ ngx_http_upstream_get_peer(ngx_http_upstream_ketama_chash_peer_data_t *ukchpd,
     ngx_uint_t                               i, p, *value;
     time_t                                   now;
     ngx_http_upstream_ketama_chash_peer_t   *peer;
-    ngx_http_upstream_ketama_chash_vnode_t  *vnodes;
     ngx_http_upstream_ketama_chash_peers_t  *peers = ukchpd->peers;
 
     peer = NULL;
     now = ngx_time();
-
-    vnodes = peers->continuum;
 
     value = peers->continuum[ukchpd->conti_index].peer_indexes->elts;
 
