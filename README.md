@@ -26,6 +26,23 @@ After the module added, reload nginx for seeing the changes:
 
     nginx -s reload
 
+## Installation (as a Static module)
+
+For this installation, you'll need to recompile nginx with this module and install the complied nginx in your environment.
+
+**Please note that you'll need to uninstall your current nginx from your environment before proceeding.** 
+
+    cd nginx-*version*
+    ./configure --add-module=/path/to/this/directory
+    make
+    make install
+
+These steps will reinstall nginx with the module in your machine.
+
 ## Author
 
 FengGu <flygoast@126.com>
+
+## Contributors
+
+Aditya Krishnakumar <beingadityak@outlook.in>
